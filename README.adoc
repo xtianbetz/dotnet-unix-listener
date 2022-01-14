@@ -1,0 +1,3 @@
+= .NET Unix Socket Demo
+
+Simple demo of UNIX socket server capable of handling mutiple simultaneous clients, 100% async without Task.Run().
