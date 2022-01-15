@@ -4,24 +4,32 @@ using System.Linq;
 using System.Net.Sockets;
 using System.Threading;
 using System.Threading.Tasks;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
+
 
 namespace DemoUnixListener
 {
-    class Program
+    class DemoUnixListener
     {
-        static async Task Main(string[] args)
+        private ILogger _logger;
+            
+        public DemoUnixListener(ILogger logger)
+        {
+            _logger = logger;
+        }
+        
+        public async Task Run(string unixSocketpath, CancellationToken cancellationToken)
         {
             var recvSocket = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
 
-            var unixSocketpath = "foo.sock";
             System.IO.File.Delete(unixSocketpath);
             var ep = new UnixDomainSocketEndPoint(unixSocketpath);
             recvSocket.Bind(ep);
             recvSocket.Listen(1024);
-
-            var cts = new CancellationTokenSource();
-            
-            Console.WriteLine("Waiting for clients...");
+           
+            _logger.LogInformation("Waiting for clients...");
 
             // Sadly, only later .NET versions have cancellation token support in AcceptAsync
             // TODO: use cancellation token to Make this code better for later .NET versions
@@ -30,7 +38,7 @@ namespace DemoUnixListener
             var clientSendTasksById = new Dictionary<int, Task>();
 
             var idleTimerMs = 15000;
-            var idleTimerTask = Task.Delay(idleTimerMs);
+            var idleTimerTask = Task.Delay(idleTimerMs, cancellationToken);
             var bytesToSend = System.Text.Encoding.UTF8.GetBytes("hi\n").ToArray();
             
             var allRunningTasks = new List<Task>();
@@ -40,9 +48,9 @@ namespace DemoUnixListener
             var clientSocksByTaskId = new Dictionary<int, Socket>();
             var clientBufsByTaskId = new Dictionary<int, byte[]>();
             
-            while (true)
+            while (!cancellationToken.IsCancellationRequested)
             {
-                Console.WriteLine("Waiting on {0} tasks", allRunningTasks.Count);
+                _logger.LogInformation("Waiting on {0} tasks", allRunningTasks.Count);
                 var finishedTask = await Task.WhenAny(allRunningTasks);
 
                 if (finishedTask.Id == idleTimerTask.Id)
@@ -54,11 +62,11 @@ namespace DemoUnixListener
                 else if (finishedTask.Id == accepterTask.Id)
                 {
                     var clientSock = await accepterTask;
-                    Console.WriteLine("Got a new client. Waiting to read data from socket.");
+                    _logger.LogInformation("Got a new client. Waiting to read data from socket");
 
                     // Schedule a new task to receive the client's data
                     var buf = new byte[1024];
-                    var clientReceiveTask = clientSock.ReceiveAsync(buf.AsMemory(), SocketFlags.None, cts.Token).AsTask();
+                    var clientReceiveTask = clientSock.ReceiveAsync(buf.AsMemory(), SocketFlags.None, cancellationToken).AsTask();
                     clientSocksByTaskId[clientReceiveTask.Id] = clientSock;
                     clientBufsByTaskId[clientReceiveTask.Id] = buf;
                     clientReceiveTasksById[clientReceiveTask.Id] = clientReceiveTask;
@@ -74,12 +82,12 @@ namespace DemoUnixListener
                         if (finishedTask.Id == clientReceiveTask.Id)
                         {
                             var msg = clientBufsByTaskId[clientReceiveTask.Id];
-                            Console.WriteLine("Client said: {0}", System.Text.Encoding.UTF8.GetString(msg));
+                            _logger.LogInformation($"Client said: {0}", System.Text.Encoding.UTF8.GetString(msg));
                             clientBufsByTaskId.Remove(clientReceiveTask.Id);
 
                             // Schedule a new task to send a response
                             var clientSock = clientSocksByTaskId[clientReceiveTask.Id];
-                            var clientSendTask = clientSock.SendAsync(bytesToSend, SocketFlags.None, cts.Token).AsTask();
+                            var clientSendTask = clientSock.SendAsync(bytesToSend, SocketFlags.None, cancellationToken).AsTask();
                             clientSendTasksById[clientSendTask.Id] = clientSendTask;
 
                             // Re-associate our socket with the sending task
@@ -96,7 +104,7 @@ namespace DemoUnixListener
                     {
                         if (finishedTask.Id == clientSendTask.Id)
                         {
-                            Console.WriteLine("Finished sending data to client, closing socket.");
+                            _logger.LogInformation("Finished sending data to client, closing socket");
                             clientSocksByTaskId[clientSendTask.Id].Close();
                             
                             clientSocksByTaskId.Remove(clientSendTask.Id);
@@ -120,7 +128,76 @@ namespace DemoUnixListener
                 {
                     allRunningTasks.Add(item); 
                 }
+            }            
+        }
+    }
+
+    class UnixListenerHostedService : IHostedService
+    {
+        private ILogger<IHostedService> _logger;
+        private CancellationToken _token;
+        private IHostApplicationLifetime _applicationLifetime; 
+
+        public UnixListenerHostedService(ILogger<UnixListenerHostedService> logger,
+            IHostApplicationLifetime applicationLifetime)
+        {
+            _logger = logger;
+            _applicationLifetime = applicationLifetime;
+        }
+
+        public async Task HandleCommandLineArguments(CancellationToken cancellationToken)
+        {
+            var unixSocketpath = "foo.sock";
+            var listener = new DemoUnixListener(_logger);
+
+            _token = cancellationToken;
+
+            try
+            {
+                await listener.Run(unixSocketpath, cancellationToken);
             }
+            catch (TaskCanceledException)
+            {
+                _logger.LogInformation("Shutting Down");
+            }            
+        }
+        
+        public Task StartAsync(CancellationToken cancellationToken)
+        {
+            _applicationLifetime.ApplicationStarted.Register(() =>
+            {
+                Task.Run(async () => { await HandleCommandLineArguments(cancellationToken); }, cancellationToken);
+            });                                                                 
+                                                                    
+            return Task.CompletedTask;                                          
+        }
+
+        public Task StopAsync(CancellationToken cancellationToken)
+        {
+            _logger.LogInformation("Exiting with return code 0");
+            Environment.ExitCode = 0;
+            return Task.CompletedTask;
+        }
+    } 
+    
+    class Program
+    {
+        static async Task Main(string[] args)
+        {
+            await Host.CreateDefaultBuilder(args)
+                .ConfigureLogging(logging =>
+                {
+                    logging.ClearProviders();
+                    logging.AddSystemdConsole(options =>
+                    {
+                        options.TimestampFormat = "hh:mm:ss.fff ";
+                    });
+                })
+                .ConfigureServices(services =>
+                {
+                    services.AddHostedService<UnixListenerHostedService>();
+                })
+                .RunConsoleAsync();
         }
     }
 }
