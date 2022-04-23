@@ -1,3 +1,86 @@
 = .NET Unix Socket Demo
 
-Simple demo of UNIX socket server capable of handling mutiple simultaneous clients, 100% async without Task.Run().
+UNIX socket server capable of handling JSON-RPC requests from mutiple simultaneous clients, 100% async without Task.Run().
+
+== Tests
+
+=== A normal successful request
+
+Make a normal JSON-RPC Request:
+
+....
+(cat MyCompany.MyApp.Foo.json && echo && sleep 4) | socat - UNIX-CONNECT:./DemoUnixListener/bin/Debug/netcoreapp3.1/dotnet-unix-listener.sock
+....
+
+Get a normal result back:
+
+....
+{"result":45,"id":"deadbeefcafebabe"}
+....
+
+=== Client closes connection early
+
+Make a request and don't wait long enough for a response
+
+....
+(cat MyCompany.MyApp.Foo.json && echo) | socat - UNIX-CONNECT:./DemoUnixListener/bin/Debug/netcoreapp3.1/dotnet-unix-listener.sock
+....
+
+Expected result in log: "Got socket exception: Broken pipe""
+
+
+=== Request with invalid JSON
+
+Make a bad request:
+
+....
+echo blub | socat - UNIX-CONNECT:./DemoUnixListener/bin/Debug/netcoreapp3.1/dotnet-unix-listener.sock
+....
+
+Get back an error response:
+
+....
+{"error":{"code":400,"message":"Bad Request"},"id":"deadbeefcafebabe"}
+....
+
+=== Request with Unknown Method
+
+Make a request with unknown method:
+
+....
+(cat MyCompany.MyApp.Bar.unknownmethod.json && echo && sleep 3) | socat - UNIX-CONNECT:./DemoUnixListener/bin/Debug/netcoreapp3.1/dotnet-unix-listener.sock
+....
+
+Get back an error:
+
+....
+{"error":{"code":501,"message":"Unknown method MyCompany.MyApp.Bar"},"id":"deadbeefcafebabe"}
+....
+
+=== Request with Bad Params Method
+
+Send a request where params are missing or wrong:
+
+....
+(cat MyCompany.MyApp.Foo.badparams.json && echo && sleep 3) | socat - UNIX-CONNECT:./DemoUnixListener/bin/Debug/netcoreapp3.1/dotnet-unix-listener.sock
+....
+
+Get back an error complaining about bad params:
+
+....
+{"error":{"code":400,"message":"Bad params object in request"},"id":"deadbeefcafebabe"}
+....
+
+=== Request that should fail with App-defined Exception
+
+Send request with a parameter that causes an error in the app-defined handler:
+
+....
+(cat MyCompany.MyApp.Foo.shouldfail.json && echo && sleep 4) | socat - UNIX-CONNECT:./DemoUnixListener/bin/Debug/netcoreapp3.1/dotnet-unix-listener.sock
+....
+
+Get back a custom error message
+
+....
+{"error":{"code":1000,"message":"We don't need no stinkin' badgers!"},"id":"deadbeefcafebabe"}
+....
